@@ -32,11 +32,17 @@ func main() {
 
 	go func() {
 		for {
-			_, raw, _ := sub.RecvMessageBytes(0)
-			fmt.Println("📥 Recebido replicate:", string(raw[0]))
+			raw, err := sub.RecvMessageBytes(0)
+			if err != nil {
+				fmt.Println("Erro ao receber mensagem:", err)
+				continue
+			}
+			if len(raw) > 0 {
+				fmt.Println("📥 Recebido replicate:", string(raw[0]))
+			}
 		}
 	}()
-
+	
 	for {
 		time.Sleep(10 * time.Second)
 		clock++
