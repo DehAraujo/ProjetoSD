@@ -1,61 +1,75 @@
-import zmq, json, time, uuid, os
+# server/server.py
+import zmq, json, os
 from datetime import datetime
 
-BROKER = "tcp://broker:5556"
-PROXY = "tcp://proxy:5557"
-DATA_PATH = "/app/data/data.jsonl"
+BROKER = "tcp://broker:5556"   # conecta no DEALER do broker
+DATA_FILE = "/app/data/state.json"
 
 os.makedirs("/app/data", exist_ok=True)
-server_name = os.getenv("SERVER_NAME", "ServerX")
-clock = 0
+# inicializa storage
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "w") as f:
+        json.dump({"users": [], "channels": []}, f)
+
+def load_state():
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def save_state(state):
+    with open(DATA_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 ctx = zmq.Context()
 rep = ctx.socket(zmq.REP)
 rep.connect(BROKER)
+print("Servidor (REP) conectado ao broker:", BROKER)
 
-pub = ctx.socket(zmq.PUB)
-pub.connect(PROXY)
-
-sub = ctx.socket(zmq.SUB)
-sub.connect("tcp://proxy:5558")
-sub.setsockopt_string(zmq.SUBSCRIBE, "replicate")
-
-def persist(entry):
-    with open(DATA_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-print(f"🧠 {server_name} ativo e conectado ao broker.")
-
-poller = zmq.Poller()
-poller.register(rep, zmq.POLLIN)
-poller.register(sub, zmq.POLLIN)
+def now():
+    return datetime.utcnow().isoformat()
 
 while True:
-    socks = dict(poller.poll(100))
-    # Recebe pedido do broker
-    if rep in socks:
-        msg = rep.recv_json()
-        clock = max(clock, msg.get("clock", 0)) + 1
-        svc = msg["service"]
+    try:
+        raw = rep.recv_json()
+    except Exception as e:
+        print("Erro recv:", e)
+        continue
 
-        if svc == "publish":
-            entry = {
-                "op_id": str(uuid.uuid4()),
-                "type": "publish",
-                "from": msg["data"]["user"],
-                "content": msg["data"]["content"],
-                "timestamp": datetime.utcnow().isoformat(),
-                "clock": clock,
-            }
-            persist(entry)
-            pub.send_multipart([b"replicate", json.dumps(entry).encode()])
-            rep.send_json({"status": "OK", "clock": clock})
+    svc = raw.get("service")
+    data = raw.get("data", {})
+    # Carrega estado atual
+    state = load_state()
+
+    if svc == "login":
+        user = data.get("user")
+        ts = data.get("timestamp", now())
+        # checa existência
+        exists = any(u["user"] == user for u in state["users"])
+        if not user:
+            rep.send_json({"service":"login","data":{"status":"erro","timestamp":now(),"description":"user missing"}})
+        elif exists:
+            rep.send_json({"service":"login","data":{"status":"erro","timestamp":now(),"description":"user exists"}})
         else:
-            rep.send_json({"status": "UNKNOWN_SERVICE", "clock": clock})
+            state["users"].append({"user": user, "timestamp": ts})
+            save_state(state)
+            rep.send_json({"service":"login","data":{"status":"sucesso","timestamp":now()}})
 
-    # Recebe replicação
-    if sub in socks:
-        topic, raw = sub.recv_multipart()
-        data = json.loads(raw)
-        if data.get("op_id"):
-            persist(data)
+    elif svc == "users":
+        rep.send_json({"service":"users","data":{"timestamp":now(),"users":[u["user"] for u in state["users"]]}})
+
+    elif svc == "channel":
+        ch = data.get("channel")
+        ts = data.get("timestamp", now())
+        if not ch:
+            rep.send_json({"service":"channel","data":{"status":"erro","timestamp":now(),"description":"channel missing"}})
+        elif any(c["channel"] == ch for c in state["channels"]):
+            rep.send_json({"service":"channel","data":{"status":"erro","timestamp":now(),"description":"already exists"}})
+        else:
+            state["channels"].append({"channel": ch, "timestamp": ts})
+            save_state(state)
+            rep.send_json({"service":"channel","data":{"status":"sucesso","timestamp":now()}})
+
+    elif svc == "channels":
+        rep.send_json({"service":"channels","data":{"timestamp":now(),"channels":[c["channel"] for c in state["channels"]]}})
+
+    else:
+        rep.send_json({"service":"error","data":{"timestamp":now(),"description":"unknown service"}})
